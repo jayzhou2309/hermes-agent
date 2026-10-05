@@ -278,6 +278,21 @@ async def test_created_then_credentialed_profile_is_served_without_restart(tmp_p
 
 
 @pytest.mark.asyncio
+async def test_hook_consent_recorded_after_boot_rescans_the_profile(tmp_path, monkeypatch):
+    runner, home = _runner(tmp_path, monkeypatch)
+    alpha_dir = _mkprofile(home, "alpha", "DISCORD_BOT_TOKEN=alpha-token\n")
+    with patch("hermes_cli.profiles.get_active_profile_name", return_value="default"):
+        await runner._start_secondary_profile_adapters()
+        assert runner._started.count("alpha") == 1
+
+        (alpha_dir / "shell-hooks-allowlist.json").write_text(
+            '{"approvals": [{"event": "pre_tool_call", "command": "/bin/true"}]}', encoding="utf-8")
+        result = await runner.reconcile_served_profiles()
+        assert result["rescanned"] == ["alpha"]
+        assert runner._started.count("alpha") == 2
+
+
+@pytest.mark.asyncio
 async def test_deleted_profile_is_torn_down_and_unrouted_others_untouched(tmp_path, monkeypatch):
     runner, home = _runner(tmp_path, monkeypatch)
     _mkprofile(home, "alpha", "DISCORD_BOT_TOKEN=alpha-token\n")
