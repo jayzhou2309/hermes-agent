@@ -887,6 +887,34 @@ def _cmd_clean_markers(db, args):
         print(f"✓ Cleared {report['rows_affected']} row(s).")
 
 
+def _cmd_reclaim_reasoning(db, args):
+    print(f"{'Dry run — scanning' if args.dry_run else 'Scanning'} for rows that keep a second copy of "
+          "their reasoning text (#125273)…")
+
+    def _progress(info):
+        print(f"\r  Rewriting: {info['rewritten']:,}/{info['total']:,}", end="", flush=True)
+
+    try:
+        report = db.reclaim_shared_reasoning_copies(
+            dry_run=args.dry_run, backup=not args.no_backup,
+            progress_cb=None if args.dry_run else _progress)
+    except Exception as e:
+        print(f"\nError: reclaim failed: {e}\nNo conversation data was lost — re-run to continue.")
+        return
+    mb = report["bytes_reclaimed"] / (1024 * 1024)
+    if not report["rows_affected"]:
+        print("✓ No row stores a duplicate copy — nothing to reclaim.")
+        return
+    if args.dry_run:
+        print(f"Would rewrite {report['rows_affected']:,} row(s), reclaiming {mb:.1f} MB of duplicate "
+              "reasoning text (the single-copy marker replaces the second copy; every read path is unchanged).")
+        return
+    print(f"\r✓ Rewrote {report['rows_rewritten']:,} row(s), freeing {mb:.1f} MB of duplicate reasoning text.")
+    if report["backup_path"]:
+        print(f"  backup: {report['backup_path']}")
+    print("  The freed pages return to the OS with the next VACUUM: hermes sessions optimize")
+
+
 def _cmd_optimize_storage(db, args):
     db_path = db.db_path
     if not db.fts_optimize_available():
@@ -1164,7 +1192,8 @@ _DB_HANDLERS = {
     "prune": partial(_cmd_prune_or_archive, action="prune"), "pin": partial(_cmd_pin, pinning=True),
     "archive": partial(_cmd_prune_or_archive, action="archive"), "unpin": partial(_cmd_pin, pinning=False),
     "retitle-skills": _cmd_retitle_skills, "browse": _cmd_browse, "optimize": _cmd_optimize,
-    "clean-markers": _cmd_clean_markers, "optimize-storage": _cmd_optimize_storage,
+    "clean-markers": _cmd_clean_markers, "reclaim-reasoning": _cmd_reclaim_reasoning,
+    "optimize-storage": _cmd_optimize_storage,
     "repair-routing": _cmd_repair_routing, "repair-prompts": _cmd_repair_prompts, "stats": _cmd_stats,
 }
 

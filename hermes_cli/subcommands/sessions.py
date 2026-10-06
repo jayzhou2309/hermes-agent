@@ -146,6 +146,19 @@ def build_sessions_parser(subparsers, *, cmd_sessions: Callable) -> None:
     _flag(sessions_clean_markers, "--no-backup", default=False,
         help="Skip the timestamped state.db backup taken before writing (not recommended)")
 
+    sessions_reclaim_reasoning = sessions_subparsers.add_parser("reclaim-reasoning",
+        help="Rewrite rows that store the same reasoning text twice so one copy leaves the store (#125273)",
+        description="Reasoning-content providers (DeepSeek, Kimi, …) return the same "
+            "chain-of-thought as both reasoning and reasoning_content. Current builds keep "
+            "one copy, but rows written before that still hold both. This rewrites those "
+            "rows once, in place, to the single-copy marker; every read path returns both "
+            "fields exactly as before. Only the reasoning column is touched. The freed "
+            "pages come back with the next VACUUM (hermes sessions optimize).")
+    _flag(sessions_reclaim_reasoning, "--dry-run", default=False,
+        help="Report the affected row count and the reclaimable size without writing")
+    _flag(sessions_reclaim_reasoning, "--no-backup", default=False,
+        help="Skip the timestamped state.db backup taken before writing (not recommended)")
+
     sessions_optimize_storage = sessions_subparsers.add_parser("optimize-storage",
         help="Migrate the search index to the compact v23 layout (reclaims disk on large DBs)",
         description="Rebuild the full-text search index in the compact v23 "
