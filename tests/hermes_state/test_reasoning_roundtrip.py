@@ -184,3 +184,85 @@ class TestSharedReasoningStoredOnce:
         assert tuple(self._columns(db, "fork")) == (_SHARED_REASONING, self.TEXT)
         msg = _assistant(db.get_messages_as_conversation("fork"))
         assert (msg["reasoning"], msg["reasoning_content"]) == (self.TEXT, self.TEXT)
+
+
+class TestReclaimSharedReasoningCopies:
+    """Rows written before the writer-side dedup still hold both copies. The reclaim rewrites them
+    once so the second copy leaves the store; every read path returns both fields as before."""
+
+    TEXT = "compare both branches first"
+
+    def _legacy_row(self, db, sid="old"):
+        """A row as a pre-fix build left it: reasoning and reasoning_content byte-identical."""
+        db.create_session(sid, source="cli")
+        db.append_message(sid, role="user", content="hi")
+        db.append_message(sid, role="assistant", content="done",
+                          reasoning=self.TEXT, reasoning_content=self.TEXT)
+        db._execute_write(lambda conn: conn.execute(
+            "UPDATE messages SET reasoning = ?, reasoning_content = ? WHERE role = 'assistant'",
+            (self.TEXT, self.TEXT)))
+        return sid
+
+    def _columns(self, db, sid):
+        with db._read_ctx() as conn:
+            return conn.execute(
+                "SELECT reasoning, reasoning_content FROM messages "
+                "WHERE session_id = ? AND role = 'assistant'", (sid,)).fetchone()
+
+    def test_dry_run_reports_without_writing(self, db):
+        sid = self._legacy_row(db)
+        report = db.reclaim_shared_reasoning_copies(dry_run=True)
+        assert report["rows_affected"] == 1
+        assert report["rows_rewritten"] == 0
+        assert report["bytes_reclaimed"] == len(self.TEXT) - len(_SHARED_REASONING)
+        assert tuple(self._columns(db, sid)) == (self.TEXT, self.TEXT)  # untouched
+
+    def test_reclaim_rewrites_the_second_copy(self, db):
+        sid = self._legacy_row(db)
+        report = db.reclaim_shared_reasoning_copies(backup=False)
+        assert (report["rows_affected"], report["rows_rewritten"]) == (1, 1)
+        assert report["bytes_reclaimed"] > 0
+        assert tuple(self._columns(db, sid)) == (_SHARED_REASONING, self.TEXT)
+
+    def test_every_read_path_still_returns_both_fields(self, db):
+        sid = self._legacy_row(db)
+        db.reclaim_shared_reasoning_copies(backup=False)
+        for msg in (_assistant(db.get_messages_as_conversation(sid)), _assistant(db.get_messages(sid))):
+            assert msg["reasoning"] == self.TEXT
+            assert msg["reasoning_content"] == self.TEXT
+
+    def test_differing_text_is_left_alone(self, db):
+        db.create_session("diff", source="cli")
+        db.append_message("diff", role="assistant", content="done", reasoning="x")
+        db._execute_write(lambda conn: conn.execute(
+            "UPDATE messages SET reasoning = 'summary + x', reasoning_content = 'x' WHERE role = 'assistant'"))
+        report = db.reclaim_shared_reasoning_copies(backup=False)
+        assert report["rows_affected"] == 0
+        assert tuple(self._columns(db, "diff")) == ("summary + x", "x")
+
+    def test_blank_pad_is_left_alone(self, db):
+        db.create_session("pad", source="cli")
+        db.append_message("pad", role="assistant", content="done", reasoning_content=" ")
+        db._execute_write(lambda conn: conn.execute(
+            "UPDATE messages SET reasoning = ' ', reasoning_content = ' ' WHERE role = 'assistant'"))
+        assert db.reclaim_shared_reasoning_copies(backup=False)["rows_affected"] == 0
+
+    def test_reclaim_is_idempotent(self, db):
+        self._legacy_row(db)
+        assert db.reclaim_shared_reasoning_copies(backup=False)["rows_rewritten"] == 1
+        second = db.reclaim_shared_reasoning_copies(backup=False)
+        assert (second["rows_affected"], second["rows_rewritten"]) == (0, 0)
+
+    def test_every_row_is_reached_across_chunks(self, db):
+        for i in range(5):
+            self._legacy_row(db, sid=f"old{i}")
+        report = db.reclaim_shared_reasoning_copies(backup=False, chunk_size=2)
+        assert report["rows_rewritten"] == 5
+        assert db.reclaim_shared_reasoning_copies(backup=False)["rows_affected"] == 0
+
+    def test_backup_is_written_when_requested(self, db):
+        self._legacy_row(db)
+        report = db.reclaim_shared_reasoning_copies(backup=True)
+        assert report["backup_path"] is not None
+        from pathlib import Path
+        assert Path(report["backup_path"]).exists()

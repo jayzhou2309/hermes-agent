@@ -1808,3 +1808,57 @@ class SessionMessagesMixin:
         if affected_ids:
             logger.info("Permanently cleared %d stale tool-call marker row(s) in state.db (#78148)", len(affected_ids))
         return _result(affected_ids, backup_path)
+
+    # Rows per pass. The rewrite is in place, so a multi-GB store never materialises a full id list.
+    _RECLAIM_REASONING_CHUNK = 500
+
+    def reclaim_shared_reasoning_copies(self, *, dry_run: bool = False, backup: bool = True,
+                                        progress_cb=None,
+                                        chunk_size: int = _RECLAIM_REASONING_CHUNK) -> Dict[str, Any]:
+        """Rewrite rows that still hold the identical reasoning text twice, so the second copy leaves
+        the store (#125273). Providers that answer with ``reasoning_content`` had the same text written
+        to both ``reasoning`` and ``reasoning_content``; writes since the single-copy marker keep one
+        copy and every read path rebuilds the other (``_restore_shared_reasoning``). Rows whose two
+        columns differ, carry one side only, or hold a blank pad are left alone, so a second run finds
+        nothing. Only ``reasoning`` is touched and no reader changes behaviour; the freed pages come
+        back with the next VACUUM. ``backup``: ``VACUUM INTO`` snapshot before the first write."""
+        select = (
+            "SELECT id, reasoning FROM messages WHERE id > ? AND reasoning IS NOT NULL "
+            "AND reasoning_content IS NOT NULL AND reasoning = reasoning_content "
+            "AND TRIM(reasoning_content) <> '' ORDER BY id LIMIT ?")
+        rows_affected = rows_rewritten = bytes_reclaimed = 0
+        backup_path: Optional[str] = None
+        last_id = 0
+        while True:
+            with self._read_ctx() as conn:
+                rows = conn.execute(select, (last_id, chunk_size)).fetchall()
+            if not rows:
+                break
+            ids = [row["id"] for row in rows]
+            last_id = ids[-1]
+            rows_affected += len(ids)
+            bytes_reclaimed += sum(len(row["reasoning"]) - len(_SHARED_REASONING) for row in rows)
+            if dry_run:
+                if progress_cb:
+                    progress_cb({"rewritten": 0, "total": rows_affected})
+                continue
+            if backup_path is None and backup:
+                import datetime
+                stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                backup_path = str(self.db_path.with_name(f"{self.db_path.name}.pre-reclaim-reasoning-backup-{stamp}"))
+                with self._lock:
+                    self._conn.execute("VACUUM INTO ?", (backup_path,))
+                logger.info("Backed up state.db to %s before reclaiming duplicate reasoning (#125273)", backup_path)
+
+            def _do(conn, ids=ids):
+                conn.execute(f"UPDATE messages SET reasoning = ? WHERE id IN ({_placeholders(ids)})",
+                             (_SHARED_REASONING, *ids))
+                return len(ids)
+            rows_rewritten += self._execute_write(_do) or 0
+            if progress_cb:
+                progress_cb({"rewritten": rows_rewritten, "total": rows_affected})
+        if rows_rewritten:
+            logger.info("Reclaimed the duplicate reasoning copy from %d row(s) in state.db (#125273)",
+                        rows_rewritten)
+        return {"dry_run": dry_run, "rows_affected": rows_affected, "rows_rewritten": rows_rewritten,
+                "bytes_reclaimed": bytes_reclaimed, "backup_path": backup_path}
