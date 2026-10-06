@@ -247,6 +247,25 @@ class TestCloudProviderCachePolicy:
         assert browser_tool._cloud_provider_resolved is True
 
 
+    def test_autodetect_skips_disabled_plugin_provider(self, monkeypatch):
+        """Regression for #134152: a provider whose plugin is disabled never registers, so
+        auto-detect must not build it from its class even when its credentials are set."""
+        monkeypatch.setattr("hermes_cli.config.read_raw_config", lambda: {"browser": {}})
+        monkeypatch.setenv("BROWSER_USE_API_KEY", "test-key")
+        browserbase = Mock(name="browserbase")
+        browserbase.is_available.return_value = False
+        registered = {"browserbase": browserbase}
+        monkeypatch.setattr("tools.browser_tool_cloud._ensure_browser_plugins_loaded", lambda: None)
+        monkeypatch.setattr("tools.browser_tool_cloud._registry_get_browser_provider", registered.get)
+
+        assert bt_cloud._get_cloud_provider() is None
+
+        browser_use = Mock(name="browser-use")
+        browser_use.is_available.return_value = True
+        registered["browser-use"] = browser_use
+
+        assert bt_cloud._get_cloud_provider() is browser_use
+
     def test_explicit_provider_instantiation_failure_does_not_cache(
         self, monkeypatch, caplog
     ):
